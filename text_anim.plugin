@@ -1,0 +1,471 @@
+import time
+import random
+import threading
+import string
+from typing import Any, List
+
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import get_last_fragment, get_messages_controller, send_request
+from android_utils import log, run_on_ui_thread
+from ui.settings import Header, Switch, Input, Divider, Text
+
+from java import jclass
+from java.util import ArrayList
+
+__id__ = "text_anim"
+__name__ = "Text Animation"
+__version__ = "1.0.0"
+__author__ = "github.com/Fon616"
+__description__ = "\u0410\u043d\u0438\u043c\u0430\u0446\u0438\u0438 \u0442\u0435\u043a\u0441\u0442\u0430: reveal / zago / random / decode / wave"
+__min_version__ = "11.12.1"
+
+_MODES = ("reveal", "zago", "random", "decode", "wave")
+_MODES_RU = {"reveal": "\u043f\u043e\u0431\u0443\u043a\u0432\u0435\u043d\u043d\u043e", "zago": "\u0437\u0430\u0447\u0438\u0441\u0442\u043a\u0430", "random": "\u0441\u043b\u0443\u0447\u0430\u0439\u043d\u044b\u0435", "decode": "\u0440\u0430\u0441\u0448\u0438\u0444\u0440\u043e\u0432\u043a\u0430", "wave": "\u0432\u043e\u043b\u043d\u0430"}
+_NOISE = string.ascii_letters + string.digits + "!@#$%%&*?/\\\\|~^"
+
+
+def _noise(n):
+    if n <= 0:
+        return ""
+    return "".join(random.choice(_NOISE) for _ in range(n))
+
+
+def _is_out(m):
+    out = getattr(m, "out", None)
+    if isinstance(out, bool):
+        return out
+    return bool((getattr(m, "flags", 0) or 0) & 1)
+
+
+_DBG_PATH = None
+_dbg_lock = threading.Lock()
+
+
+def _dbg(msg):
+    line = time.strftime("%H:%M:%S") + " " + str(msg) + "\n"
+    with _dbg_lock:
+        try:
+            global _DBG_PATH
+            if _DBG_PATH is None:
+                _DBG_PATH = _resolve_dbg_path()
+            if _DBG_PATH:
+                with open(_DBG_PATH, "a", encoding="utf-8") as f:
+                    f.write(line)
+        except Exception:
+            pass
+    try:
+        log("[" + __id__ + "] " + str(msg))
+    except Exception:
+        pass
+
+
+def _resolve_dbg_path():
+    try:
+        frag = get_last_fragment()
+        act = frag.getParentActivity()
+        d = act.getExternalFilesDir(None)
+        if d:
+            return d + "/text_anim.log"
+    except Exception:
+        pass
+    return "/sdcard/Android/data/com.radolyn.ayugram/files/text_anim.log"
+
+
+class TextAnimPlugin(BasePlugin):
+    def __init__(self):
+        try:
+            super().__init__()
+        except Exception:
+            pass
+        self._cancel_event = threading.Event()
+        self._lock = threading.Lock()
+        self._loaded = False
+
+    # lifecycle
+    def on_plugin_load(self):
+        try:
+            self.add_on_send_message_hook()
+            self._loaded = True
+            _dbg("on_plugin_load: send hook OK")
+        except Exception as e:
+            _dbg("on_plugin_load ERROR: %r" % e)
+
+    def on_plugin_unload(self):
+        self._cancel_event.set()
+        self._loaded = False
+        _dbg("on_plugin_unload")
+
+    # settings UI
+    def create_settings(self):
+        mode = str(self.get_setting("ta_mode", "reveal") or "reveal")
+        if mode not in _MODES:
+            mode = "reveal"
+        rows = [
+            Header(text=S_HEADER),
+            Switch(key="ta_enabled", text=S_ON, default=True),
+            Divider(text=S_PARAM),
+            Input(key="ta_trigger", text=S_CMD, default="/p", subtext=S_CMD_SUB),
+            Input(key="ta_default_dur", text=S_DUR, default="3", subtext=S_DUR_SUB),
+            Input(key="ta_fps", text=S_FPS, default="5", subtext=S_FPS_SUB),
+            Divider(text=S_REZHIM),
+        ]
+        for name in _MODES:
+            rows.append(
+                Text(
+                    text="  " + _MODES_RU[name] + " (" + name + ")",
+                    icon="msg_checkmark" if name == mode else "msg_radio",
+                    accent=(name == mode),
+                    on_click=lambda v, m=name: run_on_ui_thread(lambda: self._set_mode(m)),
+                )
+            )
+        rows.append(Divider(text=S_HELP_HDR))
+        rows.append(Text(text=S_HELP, icon="msg_info"))
+        return rows
+
+    def _set_mode(self, mode):
+        if mode in _MODES:
+            self.set_setting("ta_mode", mode, reload_settings=True)
+            _dbg("mode -> " + mode)
+
+    # intercept
+    def on_send_message_hook(self, account, params):
+        if not self._loaded:
+            return HookResult()
+        if str(self.get_setting("ta_enabled", "true")).lower() not in ("1", "true", "yes", "on"):
+            return HookResult()
+        trigger = str(self.get_setting("ta_trigger", "/p") or "").strip()
+        if not trigger.startswith("/"):
+            trigger = "/p"
+        try:
+            text = str(getattr(params, "message", ""))
+        except Exception:
+            return HookResult()
+        if not text.startswith(trigger):
+            return HookResult()
+        rest = text[len(trigger):].lstrip()
+        if ";" not in rest:
+            return HookResult()
+        head, tail = rest.split(";", 1)
+        payload = tail.strip()
+        if not payload:
+            return HookResult()
+
+        dur_val = None
+        if head.strip():
+            try:
+                dur_val = int(head.strip())
+            except ValueError:
+                dur_val = None
+        if dur_val is None:
+            try:
+                dur_val = int(self.get_setting("ta_default_dur", "3"))
+            except Exception:
+                dur_val = 3
+        duration = max(0.4, min(60.0, float(dur_val)))
+
+        mode = str(self.get_setting("ta_mode", "reveal") or "reveal").strip().lower()
+        if mode not in _MODES:
+            mode = "reveal"
+
+        dialog_id = None
+        topic_id = 0
+        try:
+            frag = get_last_fragment()
+            dialog_id = int(frag.getDialogId()) if frag is not None else None
+        except Exception as e:
+            _dbg("dialog grab err: %r" % e)
+        try:
+            if frag is not None and hasattr(frag, "getTopicId"):
+                topic_id = int(frag.getTopicId()) or 0
+        except Exception:
+            pass
+
+        _dbg("MATCH trigger=%s payload=%s dur=%s mode=%s dialog=%s topic=%s"
+             % (trigger, payload, duration, mode, dialog_id, topic_id))
+
+        self._cancel_event.set()
+        self._cancel_event = threading.Event()
+        active = {
+            "cancel": self._cancel_event, "mode": mode, "payload": payload,
+            "duration": duration, "dialog_id": dialog_id, "topic_id": topic_id,
+            "peer": None, "msg_id": None,
+        }
+
+        first_frame = self._first_frame(mode, payload)
+        params.message = first_frame
+        try:
+            params.entities = ArrayList()
+        except Exception:
+            pass
+        _dbg("SEND first_frame=%r" % first_frame)
+
+        threading.Thread(target=self._run, args=(active,), daemon=True).start()
+        return HookResult(strategy=HookStrategy.MODIFY_FINAL, params=params)
+
+    # frames
+    def _first_frame(self, mode, payload):
+        if mode != "reveal":
+            return _noise(len(payload))
+        return payload[0] if payload else ""
+
+    def _frames(self, mode, payload):
+        n = max(1, len(payload))
+        if mode == "reveal":
+            return [payload[:i] for i in range(1, n + 1)]
+        if mode == "zago":
+            noise = _noise(n)
+            return [payload[:i] + noise[i:] for i in range(1, n + 1)]
+        if mode == "random":
+            steps = max(8, min(n * 2, 40))
+            cur = list(_noise(n))
+            fixed = [False] * n
+            out = []
+            for s in range(steps):
+                p = (s + 1) / (steps + 1)
+                for j in range(n):
+                    if not fixed[j] and random.random() < p:
+                        cur[j] = payload[j]
+                        fixed[j] = True
+                out.append("".join(cur))
+            return out
+        if mode == "decode":
+            noise = _noise(n)
+            return [payload[:n - k] + noise[n - k:] for k in range(1, n + 1)]
+        if mode == "wave":
+            win = max(1, int(n / 6) + 1)
+            out = []
+            for base in range(0, n, win):
+                for pos in range(base, min(base + win, n) + 1):
+                    out.append(payload[:pos] + payload[pos:pos + win]
+                               + _noise(max(0, n - (pos + win))))
+            return out
+        return [payload]
+
+    # runner
+    def _run(self, active):
+        cancel = active["cancel"]
+        payload = active["payload"]
+        mode = active["mode"]
+        duration = active["duration"]
+        fps = self._get_fps()
+        _dbg("RUN start: mode=%s frames dur=%s fps=%d" % (mode, duration, fps))
+        time.sleep(0.5)
+
+        found = False
+        for attempt in range(4):
+            if cancel.is_set():
+                return
+            found = self._resolve(active)
+            _dbg("resolve attempt%d: peer=%s msg_id=%s found=%s"
+                 % (attempt + 1, active.get("peer"), active.get("msg_id"), found))
+            if found:
+                break
+            time.sleep(0.5)
+
+        msg_id = active.get("msg_id")
+        if not found or msg_id is None:
+            _dbg("ABORT: msg_id not found (dialog=%s)" % active.get("dialog_id"))
+            return
+
+        if mode == "random":
+            self._run_random(active, fps)
+        else:
+            frames = self._frames(mode, payload)
+            total = len(frames)
+            # one tick per frame, but never slower than 1/fps and never faster
+            # than the declared duration; short texts finish earlier than `dur`
+            interval = max(1.0 / fps, duration / total)
+            last = frames[0]
+            # skip frame[0] - it was already sent via MODIFY_FINAL as the first message
+            for i in range(1, total):
+                if cancel.is_set():
+                    break
+                text = payload if i == total - 1 else frames[i]
+                if text != last:
+                    ok = self._edit(active, text)
+                    _dbg("EDIT[%d/%d] %r -> ok=%s" % (i + 1, total, text, ok))
+                    last = text
+                time.sleep(interval)
+        if cancel.is_set():
+            self._edit(active, payload)
+        _dbg("RUN end")
+
+    def _get_fps(self):
+        try:
+            v = int(self.get_setting("ta_fps", "5"))
+        except Exception:
+            v = 5
+        return max(1, min(15, v))
+
+    # realtime noise stream: unconfirmed letters reshuffle every tick,
+    # confirmation chance grows with time, hard stop at `duration`
+    def _run_random(self, active, fps):
+        cancel = active["cancel"]
+        payload = active["payload"]
+        n = len(payload)
+        duration = active["duration"]
+        tick = 1.0 / fps
+        cur = list(_noise(n))
+        fixed = [False] * n
+        last_sent = ""
+        t0 = time.time()
+        edits = 0
+        while not cancel.is_set():
+            t = time.time() - t0
+            if t >= duration:
+                break
+            p = 0.05 + 0.95 * (t / duration)
+            for j in range(n):
+                if fixed[j]:
+                    continue
+                if random.random() < p:
+                    cur[j] = payload[j]
+                    fixed[j] = True
+                else:
+                    cur[j] = random.choice(_NOISE)
+            text = "".join(cur)
+            if all(fixed):
+                break
+            if text != last_sent:
+                ok = self._edit(active, text)
+                edits += 1
+                _dbg("NOISE edit=%d %r -> ok=%s" % (edits, text, ok))
+                last_sent = text
+            time.sleep(tick)
+        # ensure the final full text is on the server
+        if last_sent != payload:
+            self._edit(active, payload)
+            _dbg("NOISE final=%r" % payload)
+
+    # resolve
+    def _resolve(self, active):
+        dialog_id = active.get("dialog_id")
+        topic_id = active.get("topic_id", 0)
+        if dialog_id is None:
+            try:
+                frag = get_last_fragment()
+                dialog_id = int(frag.getDialogId()) if frag is not None else None
+                active["dialog_id"] = dialog_id
+            except Exception:
+                return False
+        if dialog_id is None:
+            return False
+        mc = get_messages_controller()
+        for sign in (dialog_id, -dialog_id):
+            peer = None
+            try:
+                peer = mc.getInputPeer(sign)
+            except Exception as e:
+                _dbg("getInputPeer(%d) err: %r" % (sign, e))
+            if peer is None:
+                continue
+            if self._try_get_history(peer, sign, topic_id, active):
+                active["peer"] = peer
+                return True
+            _dbg("sign=%d getHistory: no out msg" % sign)
+        return False
+
+    def _try_get_history(self, peer, sign, topic_id, active):
+        TLRPC = jclass("org.telegram.tgnet.TLRPC")
+        try:
+            req = TLRPC.TL_messages_getHistory()
+            req.peer = peer
+            req.offset_id = 0
+            req.limit = 20
+            req.offset_date = 0
+            req.max_id = 0
+            if topic_id:
+                req.offset_id = topic_id
+            resp = self._blocking_send(req, 3.0)
+            if resp is None:
+                _dbg("getHistory(sign=%d) resp=None" % sign)
+                return False
+            msgs = getattr(resp, "messages", None)
+            if msgs is None:
+                _dbg("getHistory(sign=%d) messages=None" % sign)
+                return False
+            cnt = msgs.size()
+            _dbg("getHistory(sign=%d) messages=%d" % (sign, cnt))
+            for k in range(cnt):
+                m = msgs.get(k)
+                if _is_out(m):
+                    active["msg_id"] = int(m.id)
+                    return True
+        except Exception as e:
+            _dbg("getHistory(sign=%d) err: %r" % (sign, e))
+        return False
+
+    # tlrpc
+    def _blocking_send(self, req, timeout=3.0):
+        result = []
+        done = threading.Event()
+
+        def on_done(response, error):
+            result.append((response, error))
+            done.set()
+
+        try:
+            run_on_ui_thread(lambda: send_request(req, on_done))
+        except Exception as e:
+            _dbg("send_request err: %r" % e)
+            return None
+        if not done.wait(timeout):
+            _dbg("TLRPC timeout")
+            return None
+        resp, err = result[0]
+        if err is not None:
+            _dbg("TLRPC err %s: %s" % (getattr(err, "code", "?"), getattr(err, "text", "?")))
+            return None
+        return resp
+
+    # edit (TLRPC field is peer, not input_chat; flags|=2048 required for message serialization)
+    def _edit(self, active, text):
+        peer = active.get("peer")
+        msg_id = active.get("msg_id")
+        if peer is None or msg_id is None:
+            _dbg("edit skip: peer=%s msg_id=%s" % (peer, msg_id))
+            return False
+        try:
+            TLRPC = jclass("org.telegram.tgnet.TLRPC")
+            req = TLRPC.TL_messages_editMessage()
+            # real TLRPC field names (from TLRPC.java):
+            #   public int flags;
+            #   public boolean no_webpage;
+            #   public InputPeer peer;
+            #   public int id;
+            #   public String message;
+            #   public ArrayList<MessageEntity> entities;
+            req.peer = peer
+            req.id = int(msg_id)
+            req.no_webpage = True
+            # CRITICAL: without flag 2048, `message` is NOT serialized to the server
+            req.flags = getattr(req, "flags", 0) | 2048
+            req.message = text
+            resp = self._blocking_send(req, 2.5)
+            if resp is not None:
+                # apply server updates to local message cache (mirrors SendMessagesHelper:2716)
+                try:
+                    mc = get_messages_controller()
+                    if hasattr(mc, "processUpdates"):
+                        mc.processUpdates(resp, False)
+                except Exception:
+                    pass
+            return resp is not None
+        except Exception as e:
+            _dbg("edit err: %r" % e)
+            return False
+
+
+# Russian UI literals
+S_HEADER = "\u0410\u043d\u0438\u043c\u0430\u0446\u0438\u044f \u0442\u0435\u043a\u0441\u0442\u0430"
+S_ON = "\u0412\u043a\u043b\u044e\u0447\u0435\u043d\u043e"
+S_PARAM = "\u041f\u0430\u0440\u0430\u043c\u0435\u0442\u0440\u044b"
+S_CMD = "\u041a\u043e\u043c\u0430\u043d\u0434\u0430"
+S_CMD_SUB = "\u041d\u0430\u0447\u0438\u043d\u0430\u0435\u0442\u0441\u044f \u0441\u043e \u0441\u043b\u0435\u0448\u0430, \u043d\u0430\u043f\u0440. /p"
+S_DUR = "\u0412\u0440\u0435\u043c\u044f \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e, \u0441\u0435\u043a"
+S_DUR_SUB = "\u0415\u0441\u043b\u0438 \u0432 \u043a\u043e\u043c\u0430\u043d\u0434\u0435 \u043d\u0435 \u0443\u043a\u0430\u0437\u0430\u043d\u043e - \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0435\u0442\u0441\u044f \u044d\u0442\u043e"
+S_FPS = "\u041e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435 \u0448\u0443\u043c\u0430 (\u043a\u0430\u0434\u0440\u043e\u0432/\u0441\u0435\u043a)"
+S_FPS_SUB = "\u0421\u043a\u043e\u0440\u043e\u0441\u0442\u044c \u043a\u0430\u0434\u0440\u043e\u0432 \u0432 \u0440\u0435\u0436\u0438\u043c\u0435 random"
+S_REZHIM = "\u0420\u0435\u0436\u0438\u043c"
+S_HELP_HDR = "\u041f\u043e\u0434\u0441\u043a\u0430\u0437\u043a\u0430"
+S_HELP = "\u0421\u0438\u043d\u0442\u0430\u043a\u0441\u0438\u0441:  /<\u043a\u043e\u043c\u0430\u043d\u0434\u0430> [\u0441\u0435\u043a\u0443\u043d\u0434\u044b] ; \u0442\u0435\u043a\u0441\u0442\n\u041f\u0440\u0438\u043c\u0435\u0440\u044b:\n  /p 5 ; \u041f\u0440\u0438\u0432\u0435\u0442\n  /p ; Hi\n  /p 2 ; \u041f\u0440\u0438\u0432\u0435\u0442"
